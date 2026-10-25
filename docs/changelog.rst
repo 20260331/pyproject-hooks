@@ -1,6 +1,20 @@
 Changelog
 =========
 
+Unreleased
+----------
+
+- Add opt-in request/response correlation checks for
+  :class:`.BuildBackendHookCaller` (``verify_correlation=True``). When enabled,
+  every hook request carries a protocol version, a unique per-call identifier
+  and a digest of its normalised content, which the hook process must echo
+  back. Responses that are missing or repeat fields, answer a different call or
+  certify different request content are rejected with :exc:`.CorrelationError`
+  before their result or warnings are delivered. Mismatched input is refused
+  before the build backend is imported. Dictionary key reordering is treated as
+  equivalent, while list order and explicit null values are significant. The
+  checks are off by default and the subprocess runner signature is unchanged.
+
 v1.3.3
 ------
 

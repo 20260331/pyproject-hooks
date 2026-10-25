@@ -1,8 +1,10 @@
+import hashlib
 import json
 import os
 import sys
 import tempfile
 import subprocess
+import uuid
 from contextlib import contextmanager
 from os.path import abspath
 from os.path import join as pjoin
@@ -26,6 +28,36 @@ if TYPE_CHECKING:
             ...
 
 
+#: Version of the optional request/response correlation protocol.
+#:
+#: When correlation checks are enabled, the frontend puts this in
+#: ``input.json`` and requires it to be echoed in ``output.json``. Bump this
+#: whenever the structure of either JSON file changes.
+CORRELATION_PROTOCOL_VERSION = 1
+
+#: Keys every correlated ``output.json`` must contain.
+_REQUIRED_RESPONSE_KEYS = frozenset(
+    {
+        "protocol",
+        "request_id",
+        "request_digest",
+        "return_val",
+        "unsupported",
+        "warnings",
+    }
+)
+
+#: Keys which a correlated ``output.json`` is allowed to contain in addition to
+#: the required ones.
+_KNOWN_RESPONSE_KEYS = _REQUIRED_RESPONSE_KEYS | {
+    "no_backend",
+    "traceback",
+    "backend_error",
+    "hook_missing",
+    "missing_hook_name",
+}
+
+
 def write_json(obj: Mapping[str, Any], path: str, **kwargs) -> None:
     with open(path, "w", encoding="utf-8") as f:
         json.dump(obj, f, **kwargs)
@@ -34,6 +66,43 @@ def write_json(obj: Mapping[str, Any], path: str, **kwargs) -> None:
 def read_json(path: str) -> Mapping[str, Any]:
     with open(path, encoding="utf-8") as f:
         return json.load(f)
+
+
+def _reject_duplicate_keys(pairs: Sequence[tuple]) -> dict:
+    """``object_pairs_hook`` turning duplicate JSON keys into a ``ValueError``."""
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate JSON key: {key!r}")
+        result[key] = value
+    return result
+
+
+def read_json_strict(path: str) -> Mapping[str, Any]:
+    """Read JSON, rejecting duplicate object keys anywhere in the document."""
+    with open(path, encoding="utf-8") as f:
+        return json.load(f, object_pairs_hook=_reject_duplicate_keys)
+
+
+def canonical_json_digest(obj: Any) -> str:
+    """Return a SHA-256 digest of a canonical JSON encoding of ``obj``.
+
+    Mappings compare equal regardless of their key order, while the order of
+    sequence items is significant and an explicit ``None`` is never treated as
+    a missing value.
+    """
+    canonical = json.dumps(
+        obj,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _request_digest(hook_name: str, kwargs: Mapping[str, Any]) -> str:
+    """Digest identifying the hook invoked and the arguments it was given."""
+    return canonical_json_digest({"hook": hook_name, "kwargs": kwargs})
 
 
 class BuildBackendWarning(UserWarning):
@@ -73,6 +142,19 @@ class UnsupportedOperation(Exception):
 
     def __init__(self, traceback: str) -> None:
         self.traceback = traceback
+
+
+class CorrelationError(Exception):
+    """Will be raised when a hook response cannot be correlated with its request.
+
+    Only raised when the caller was created with ``verify_correlation=True``.
+    It means the temporary JSON files exchanged with the hook subprocess do not
+    prove that ``output.json`` answers this particular ``input.json``: the
+    protocol version, the per-call identity or the normalised request content
+    does not match (or the response is missing fields, contains duplicate
+    fields or carries unknown fields). The return value and the warnings of
+    such a response are not delivered.
+    """
 
 
 def default_subprocess_runner(
@@ -146,6 +228,7 @@ class BuildBackendHookCaller:
         backend_path: Optional[Sequence[str]] = None,
         runner: Optional["SubprocessRunner"] = None,
         python_executable: Optional[str] = None,
+        verify_correlation: bool = False,
     ) -> None:
         """
         :param source_dir: The source directory to invoke the build backend for
@@ -154,6 +237,17 @@ class BuildBackendHookCaller:
         :param runner: The :ref:`subprocess runner <Subprocess Runners>` to use
         :param python_executable:
             The Python executable used to invoke the build backend
+        :param verify_correlation:
+            Verify that the subprocess response answers this exact request.
+            Off by default. When enabled, every request carries a protocol
+            version, a unique per-call identifier and the digest of its
+            normalised content, which the hook process must echo back. A
+            response that is missing fields, repeats fields, answers a
+            different call or certifies different request content is rejected
+            with :exc:`CorrelationError` before its result or warnings are
+            delivered. This protects against custom subprocess runners that
+            replay or misdeliver stale responses, and requires the hook
+            process to run a compatible version of ``pyproject_hooks``.
         """
         if runner is None:
             runner = default_subprocess_runner
@@ -167,6 +261,7 @@ class BuildBackendHookCaller:
         if not python_executable:
             python_executable = sys.executable
         self.python_executable = python_executable
+        self.verify_correlation = verify_correlation
 
     @contextmanager
     def subprocess_runner(self, runner: "SubprocessRunner") -> Iterator[None]:
@@ -395,6 +490,85 @@ class BuildBackendHookCaller:
             },
         )
 
+    def _read_correlated_output(
+        self,
+        td: str,
+        hook_name: str,
+        kwargs: Mapping[str, Any],
+        request_id: Optional[str],
+    ) -> Mapping[str, Any]:
+        """Read ``output.json`` and prove it answers this very request.
+
+        Raise :exc:`CorrelationError` (without delivering any return value or
+        warnings) if anything about the response does not correlate.
+        """
+
+        def fail(reason: str) -> "CorrelationError":
+            return CorrelationError(
+                f"Cannot trust the response of hook {hook_name!r}: {reason}"
+            )
+
+        path = pjoin(td, "output.json")
+        try:
+            data = read_json_strict(path)
+        except FileNotFoundError:
+            raise fail(
+                "the subprocess did not write output.json, so its result cannot "
+                "be matched to the request"
+            ) from None
+        except json.JSONDecodeError as e:
+            raise fail(f"output.json is not valid JSON ({e.msg})") from None
+        except ValueError as e:
+            raise fail(f"output.json is malformed ({e})") from None
+
+        if not isinstance(data, dict):
+            raise fail("output.json must contain a JSON object")
+
+        keys = set(data)
+        missing = _REQUIRED_RESPONSE_KEYS - keys
+        if missing:
+            raise fail(f"output.json is missing field(s): {sorted(missing)}")
+        unknown = keys - _KNOWN_RESPONSE_KEYS
+        if unknown:
+            raise fail(f"output.json contains unexpected field(s): {sorted(unknown)}")
+
+        protocol = data["protocol"]
+        # bool is a subclass of int; reject it explicitly.
+        if type(protocol) is not int:
+            raise fail(f"the protocol version must be an integer, not {protocol!r}")
+        if protocol != CORRELATION_PROTOCOL_VERSION:
+            raise fail(
+                f"protocol version mismatch: the response uses version {protocol}, "
+                f"but this frontend supports version {CORRELATION_PROTOCOL_VERSION}"
+            )
+
+        response_id = data["request_id"]
+        if not isinstance(response_id, str):
+            raise fail("the response call identifier must be a string")
+        if response_id != request_id:
+            raise fail(
+                f"the response answers call {response_id!r}, but this request was "
+                f"call {request_id!r}; a stale or misrouted response may have been "
+                "delivered by the subprocess runner"
+            )
+
+        response_digest = data["request_digest"]
+        if not isinstance(response_digest, str):
+            raise fail("the request digest must be a string")
+        expected_digest = _request_digest(hook_name, kwargs)
+        if response_digest != expected_digest:
+            raise fail(
+                "the response certifies different request content than the request "
+                "which was sent (different hook name or arguments)"
+            )
+
+        if type(data["unsupported"]) is not bool:
+            raise fail("the 'unsupported' field must be a boolean")
+        if not isinstance(data["warnings"], list):
+            raise fail("the 'warnings' field must be a list")
+
+        return data
+
     def _call_hook(self, hook_name: str, kwargs: Mapping[str, Any]) -> Any:
         extra_environ = {"_PYPROJECT_HOOKS_BUILD_BACKEND": self.build_backend}
 
@@ -404,7 +578,14 @@ class BuildBackendHookCaller:
             )
 
         with tempfile.TemporaryDirectory() as td:
-            hook_input = {"kwargs": kwargs}
+            hook_input: dict[str, Any] = {"kwargs": kwargs}
+            request_id: Optional[str] = None
+            if self.verify_correlation:
+                # A fresh identity for each independent hook call makes a
+                # replayed response from an earlier call detectable.
+                request_id = str(uuid.uuid4())
+                hook_input["protocol"] = CORRELATION_PROTOCOL_VERSION
+                hook_input["request_id"] = request_id
             write_json(hook_input, pjoin(td, "input.json"), indent=2)
 
             # Run the hook in a subprocess
@@ -416,7 +597,12 @@ class BuildBackendHookCaller:
                     extra_environ=extra_environ,
                 )
 
-            data = read_json(pjoin(td, "output.json"))
+            if self.verify_correlation:
+                # Validate before anything (return value, warnings, errors) is
+                # taken from the response.
+                data = self._read_correlated_output(td, hook_name, kwargs, request_id)
+            else:
+                data = read_json(pjoin(td, "output.json"))
             if data.get("unsupported"):
                 raise UnsupportedOperation(data.get("traceback", ""))
             if data.get("no_backend"):

@@ -11,7 +11,16 @@ It expects:
 Results:
 - control_dir/output.json
   - {"return_val": ...}
+
+When the frontend enables request/response correlation checks, input.json
+additionally carries a "protocol" version, a unique "request_id" and the
+request is answered with matching "protocol", "request_id" and
+"request_digest" fields in output.json:
+  - {"kwargs": {...}, "protocol": 1, "request_id": "..."}
+  - {"return_val": ..., "protocol": 1, "request_id": "...",
+     "request_digest": "..."}
 """
+import hashlib
 import json
 import os
 import os.path
@@ -19,14 +28,18 @@ import re
 import shutil
 import sys
 import traceback
+import uuid
 from glob import glob
 from importlib import import_module
 from importlib.machinery import PathFinder
 from os.path import join as pjoin
 import warnings
 
+# Must match CORRELATION_PROTOCOL_VERSION in pyproject_hooks._impl.
+CORRELATION_PROTOCOL_VERSION = 1
+
 # This file is run as a script, and `import wrappers` is not zip-safe, so we
-# include write_json() and read_json() from wrappers.py.
+# include write_json() from wrappers.py.
 
 
 def write_json(obj, path, **kwargs):
@@ -34,9 +47,38 @@ def write_json(obj, path, **kwargs):
         json.dump(obj, f, **kwargs)
 
 
-def read_json(path):
-    with open(path, encoding="utf-8") as f:
-        return json.load(f)
+def _reject_duplicate_keys(pairs):
+    """object_pairs_hook turning duplicate JSON keys into a ValueError."""
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate JSON key: {!r}".format(key))
+        result[key] = value
+    return result
+
+
+def canonical_json_digest(obj):
+    """SHA-256 digest of a canonical JSON encoding.
+
+    Dict key order is irrelevant, list order and explicit nulls are not.
+    Kept byte-for-byte compatible with the copy in pyproject_hooks._impl.
+    """
+    canonical = json.dumps(obj, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _request_digest(hook_name, kwargs):
+    return canonical_json_digest({"hook": hook_name, "kwargs": kwargs})
+
+
+def _reject_request(message):
+    """Refuse a malformed correlated request, without importing the backend."""
+    sys.stderr.write(
+        "pyproject-hooks: refusing to run hook, invalid correlated request: "
+        + message
+        + "\n"
+    )
+    raise SystemExit(1)
 
 
 class BackendUnavailable(Exception):
@@ -356,6 +398,42 @@ HOOK_NAMES = {
 }
 
 
+def _validate_correlated_input(hook_input):
+    """Validate a correlated request before the build backend is imported."""
+    if not isinstance(hook_input, dict):
+        _reject_request("input.json must contain a JSON object")
+
+    keys = set(hook_input)
+    required = {"kwargs", "protocol", "request_id"}
+    missing = required - keys
+    if missing:
+        _reject_request("missing field(s): {}".format(sorted(missing)))
+    extra = keys - required
+    if extra:
+        _reject_request("unexpected field(s): {}".format(sorted(extra)))
+
+    protocol = hook_input["protocol"]
+    # bool is a subclass of int; reject it explicitly.
+    if type(protocol) is not int:
+        _reject_request("the protocol version must be an integer")
+    if protocol != CORRELATION_PROTOCOL_VERSION:
+        _reject_request(
+            "unsupported protocol version {}; this hook process supports "
+            "version {}".format(protocol, CORRELATION_PROTOCOL_VERSION)
+        )
+
+    request_id = hook_input["request_id"]
+    if not isinstance(request_id, str) or not request_id:
+        _reject_request("the request id must be a non-empty string")
+    try:
+        uuid.UUID(request_id)
+    except ValueError:
+        _reject_request("the request id must be a valid UUID: {!r}".format(request_id))
+
+    if not isinstance(hook_input["kwargs"], dict):
+        _reject_request("the kwargs field must be a JSON object")
+
+
 def main():
     if len(sys.argv) < 3:
         sys.exit("Needs args: hook_name, control_dir")
@@ -373,7 +451,32 @@ def main():
 
     hook = globals()[hook_name]
 
-    hook_input = read_json(pjoin(control_dir, "input.json"))
+    # The presence of the "protocol" field marks a correlated request from a
+    # frontend that opted into the checks; a plain {"kwargs": ...} document is
+    # handled exactly as before.
+    input_path = pjoin(control_dir, "input.json")
+    try:
+        with open(input_path, encoding="utf-8") as f:
+            raw_input_text = f.read()
+    except OSError as e:
+        # Even a plain request needs its input, but a missing or unreadable
+        # file must never lead to importing the backend.
+        sys.exit("Cannot read input.json: {}".format(e))
+
+    hook_input = json.loads(raw_input_text)
+    correlated = isinstance(hook_input, dict) and "protocol" in hook_input
+    if correlated:
+        # Parse the same text strictly (rejecting duplicate keys) and
+        # validate *before* importing the backend.
+        try:
+            hook_input = json.loads(
+                raw_input_text, object_pairs_hook=_reject_duplicate_keys
+            )
+        except ValueError as e:
+            _reject_request(str(e))
+        _validate_correlated_input(hook_input)
+        request_id = hook_input["request_id"]
+        request_digest = _request_digest(hook_name, hook_input["kwargs"])
 
     with warnings.catch_warnings(record=True) as captured_warnings:
         json_out = {"unsupported": False, "return_val": None}
@@ -399,6 +502,14 @@ def main():
         for w in captured_warnings
         if isinstance(w.category, type) and issubclass(w.category, UserWarning)
     ]
+
+    if correlated:
+        # Echoed on every outcome (success, missing backend, unsupported
+        # operation, missing hook) so the frontend can correlate errors too.
+        json_out["protocol"] = CORRELATION_PROTOCOL_VERSION
+        json_out["request_id"] = request_id
+        json_out["request_digest"] = request_digest
+
     write_json(json_out, pjoin(control_dir, "output.json"), indent=2)
 
 
