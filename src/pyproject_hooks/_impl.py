@@ -75,6 +75,20 @@ class UnsupportedOperation(Exception):
         self.traceback = traceback
 
 
+class InvalidHookReturn(ValueError):
+    """Will be raised if a hook returns a value violating its contract.
+
+    Only raised when the caller opts in to return value validation via
+    :class:`BuildBackendHookCaller`'s ``validate_results`` parameter. The
+    ``hook_name`` attribute identifies the hook whose return value was
+    invalid.
+    """
+
+    def __init__(self, hook_name: str, message: str) -> None:
+        self.hook_name = hook_name
+        super().__init__(f"Invalid value returned by {hook_name} hook: {message}")
+
+
 def default_subprocess_runner(
     cmd: Sequence[str],
     cwd: Optional[str] = None,
@@ -136,6 +150,146 @@ def norm_and_check(source_tree: str, requested: str) -> str:
     return abs_requested
 
 
+# --- Optional validation of values returned by build backend hooks ---------
+#
+# PEP 517 / PEP 660 establish what each hook must return (a list of strings,
+# or the basename of an artifact inside a given directory). A misbehaving
+# backend may instead return a value of the wrong type, an incorrectly named
+# or non-existent artifact, or a path escaping the target directory, which
+# would otherwise surface as a confusing failure later on in the frontend.
+# The checks below are a single implementation shared by every hook, and are
+# only run when the caller opts in via ``validate_results=True``.
+
+# Hooks which must return a list of strings.
+_STRING_LIST_HOOKS: Mapping[str, str] = {
+    "get_requires_for_build_wheel": "PEP 508 requirement specifiers",
+    "get_requires_for_build_editable": "PEP 508 requirement specifiers",
+    "get_requires_for_build_sdist": "PEP 508 requirement specifiers",
+    "_supported_features": "supported feature names",
+}
+
+# Hooks which must return the basename of an artifact created inside the
+# directory passed through a given keyword argument:
+# hook name -> (directory kwarg, required name suffix, "file"/"directory")
+_ARTIFACT_HOOKS: Mapping[str, tuple] = {
+    "build_wheel": ("wheel_directory", ".whl", "file"),
+    "build_editable": ("wheel_directory", ".whl", "file"),
+    "build_sdist": ("sdist_directory", ".tar.gz", "file"),
+    "prepare_metadata_for_build_wheel": (
+        "metadata_directory",
+        ".dist-info",
+        "directory",
+    ),
+    "prepare_metadata_for_build_editable": (
+        "metadata_directory",
+        ".dist-info",
+        "directory",
+    ),
+}
+
+
+def _validate_string_list(hook_name: str, result: Any, item_kind: str) -> None:
+    if not isinstance(result, list):
+        raise InvalidHookReturn(
+            hook_name,
+            f"expected a list of {item_kind}, got {type(result).__name__}: "
+            f"{result!r}",
+        )
+    for item in result:
+        if not isinstance(item, str):
+            raise InvalidHookReturn(
+                hook_name,
+                f"expected a list of {item_kind}, but it contains a "
+                f"{type(item).__name__}: {item!r}",
+            )
+
+
+def _validate_artifact(
+    hook_name: str,
+    result: Any,
+    directory: str,
+    suffix: str,
+    artifact_kind: str,
+) -> None:
+    if not isinstance(result, str):
+        raise InvalidHookReturn(
+            hook_name,
+            f"expected the basename of a {artifact_kind} as a string, got "
+            f"{type(result).__name__}: {result!r}",
+        )
+    if not result:
+        raise InvalidHookReturn(hook_name, "returned an empty string")
+
+    # The contract requires a bare basename: no absolute paths, separators or
+    # traversal components pointing outside the target directory.
+    if (
+        os.path.isabs(result)
+        or os.path.basename(result) != result
+        or (os.altsep is not None and os.altsep in result)
+    ):
+        raise InvalidHookReturn(
+            hook_name,
+            f"must return the basename of the {artifact_kind} created inside "
+            f"{directory!r}, without any path separators, got {result!r}",
+        )
+    if not result.endswith(suffix):
+        raise InvalidHookReturn(
+            hook_name,
+            f"must return the name of a {artifact_kind} ending with "
+            f"{suffix!r}, got {result!r}",
+        )
+
+    artifact_path = pjoin(directory, result)
+    if artifact_kind == "file":
+        if not os.path.isfile(artifact_path):
+            raise InvalidHookReturn(
+                hook_name,
+                f"the returned file does not exist in {directory!r}: " f"{result!r}",
+            )
+    else:
+        if not os.path.isdir(artifact_path):
+            raise InvalidHookReturn(
+                hook_name,
+                f"the returned directory does not exist in {directory!r}: "
+                f"{result!r}",
+            )
+
+    # Guard against a symlink (or any other non-lexical path) placing the
+    # artifact outside of the directory the hook was told to write into.
+    real_directory = os.path.realpath(directory)
+    real_artifact = os.path.realpath(artifact_path)
+    if os.path.commonpath([real_directory, real_artifact]) != real_directory:
+        raise InvalidHookReturn(
+            hook_name,
+            f"the returned {artifact_kind} resolves outside of {directory!r}: "
+            f"{result!r}",
+        )
+
+
+def _validate_hook_result(
+    hook_name: str, result: Any, kwargs: Mapping[str, Any]
+) -> None:
+    """Check a successful hook return value against its declared contract.
+
+    Raises :exc:`InvalidHookReturn` if the value does not conform. Hooks not
+    present in the contract tables are left untouched.
+    """
+    item_kind = _STRING_LIST_HOOKS.get(hook_name)
+    if item_kind is not None:
+        _validate_string_list(hook_name, result, item_kind)
+        return
+    artifact_spec = _ARTIFACT_HOOKS.get(hook_name)
+    if artifact_spec is not None:
+        directory_kwarg, suffix, artifact_kind = artifact_spec
+        _validate_artifact(
+            hook_name,
+            result,
+            kwargs[directory_kwarg],
+            suffix,
+            artifact_kind,
+        )
+
+
 class BuildBackendHookCaller:
     """A wrapper to call the build backend hooks for a source directory."""
 
@@ -146,6 +300,7 @@ class BuildBackendHookCaller:
         backend_path: Optional[Sequence[str]] = None,
         runner: Optional["SubprocessRunner"] = None,
         python_executable: Optional[str] = None,
+        validate_results: bool = False,
     ) -> None:
         """
         :param source_dir: The source directory to invoke the build backend for
@@ -154,6 +309,13 @@ class BuildBackendHookCaller:
         :param runner: The :ref:`subprocess runner <Subprocess Runners>` to use
         :param python_executable:
             The Python executable used to invoke the build backend
+        :param validate_results:
+            If true, the value returned by each successful hook call is
+            checked against the hook's contract (PEP 517 / PEP 660): its
+            type, the expected artifact name, and that the artifact exists
+            inside (and does not escape) the directory given to the hook.
+            A violation raises :exc:`InvalidHookReturn`. Existing exception
+            behaviour for backend, hook and subprocess failures is unchanged.
         """
         if runner is None:
             runner = default_subprocess_runner
@@ -167,6 +329,7 @@ class BuildBackendHookCaller:
         if not python_executable:
             python_executable = sys.executable
         self.python_executable = python_executable
+        self._validate_results = validate_results
 
     @contextmanager
     def subprocess_runner(self, runner: "SubprocessRunner") -> Iterator[None]:
@@ -436,4 +599,8 @@ class BuildBackendHookCaller:
                     filename=w["filename"],
                     lineno=w["lineno"],
                 )
-            return data["return_val"]
+
+            return_val = data["return_val"]
+            if self._validate_results:
+                _validate_hook_result(hook_name, return_val, kwargs)
+            return return_val

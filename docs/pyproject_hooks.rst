@@ -54,4 +54,5 @@ Each exception has public attributes with the same name as their constructors.
 
 .. autoexception:: pyproject_hooks.BackendUnavailable
 .. autoexception:: pyproject_hooks.HookMissing
+.. autoexception:: pyproject_hooks.InvalidHookReturn
 .. autoexception:: pyproject_hooks.UnsupportedOperation

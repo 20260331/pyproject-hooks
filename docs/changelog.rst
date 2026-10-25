@@ -1,6 +1,17 @@
 Changelog
 =========
 
+Unreleased
+----------
+
+- Add an opt-in ``validate_results`` parameter to
+  :class:`.BuildBackendHookCaller`. When enabled, values returned
+  successfully by build backend hooks are checked against their
+  :pep:`517` / :pep:`660` contracts (basic types, expected artifact names
+  and artifact boundaries) before being handed to the frontend; violations
+  raise the new :exc:`.InvalidHookReturn` exception. Validation is disabled
+  by default, and the existing exception semantics are otherwise unchanged.
+
 v1.3.3
 ------
 
