@@ -1,6 +1,19 @@
 Changelog
 =========
 
+unreleased
+----------
+
+- Add a per-hook environment envelope: ``BuildBackendHookCaller`` now accepts
+  an ``environ`` mapping of overrides, and each hook method accepts ``environ``
+  for per-call overrides. Each hook call inherits a fresh copy of
+  ``os.environ`` taken at call time, on top of which string values set or
+  replace variables and ``None`` removes them. The caller's own
+  ``os.environ`` is never modified, so parallel calls and successive hooks no
+  longer leak variables to each other. The frozen snapshot is used by the
+  subprocess runner (new ``env`` protocol parameter), backend import, hook
+  execution and fallbacks alike.
+
 v1.3.3
 ------
 

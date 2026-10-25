@@ -1,3 +1,4 @@
+import inspect
 import json
 import os
 import sys
@@ -6,13 +7,22 @@ import subprocess
 from contextlib import contextmanager
 from os.path import abspath
 from os.path import join as pjoin
-from typing import TYPE_CHECKING, Any, Iterator, Mapping, Optional, Sequence
+from types import MappingProxyType
+from typing import TYPE_CHECKING, Any, Dict, Iterator, Mapping, Optional, Sequence
 import warnings
 
 from ._in_process import _in_proc_script_path
 
 if TYPE_CHECKING:
     from typing import Protocol
+
+    #: A mapping of environment variable overrides for a hook call.
+    #: A ``str`` value sets (or overrides) an inherited variable; ``None``
+    #: requests that an inherited variable be removed from the envelope.
+    EnvironOverrides = Mapping[str, Optional[str]]
+
+    #: A frozen snapshot of the complete environment used for one hook call.
+    EnvironSnapshot = Mapping[str, str]
 
     class SubprocessRunner(Protocol):
         """A protocol for the subprocess runner."""
@@ -22,6 +32,7 @@ if TYPE_CHECKING:
             cmd: Sequence[str],
             cwd: Optional[str] = None,
             extra_environ: Optional[Mapping[str, str]] = None,
+            env: Optional[Mapping[str, str]] = None,
         ) -> None:
             ...
 
@@ -79,14 +90,23 @@ def default_subprocess_runner(
     cmd: Sequence[str],
     cwd: Optional[str] = None,
     extra_environ: Optional[Mapping[str, str]] = None,
+    env: Optional[Mapping[str, str]] = None,
 ) -> None:
     """The default method of calling the wrapper subprocess.
 
     This uses :func:`subprocess.run` under the hood.
+
+    :param env:
+        The complete environment snapshot for the hook call. When given, it is
+        passed to the subprocess verbatim (including any variables removed from
+        the inherited environment). When ``None`` (the legacy calling
+        convention), a copy of :data:`os.environ` is used and ``extra_environ``
+        is applied as an overlay.
     """
-    env = os.environ.copy()
-    if extra_environ:
-        env.update(extra_environ)
+    if env is None:
+        env = os.environ.copy()
+        if extra_environ:
+            env.update(extra_environ)
 
     subprocess.run(cmd, cwd=cwd, env=env, check=True)
 
@@ -95,14 +115,23 @@ def quiet_subprocess_runner(
     cmd: Sequence[str],
     cwd: Optional[str] = None,
     extra_environ: Optional[Mapping[str, str]] = None,
+    env: Optional[Mapping[str, str]] = None,
 ) -> None:
     """Call the subprocess while suppressing output.
 
     This uses :func:`subprocess.run` with `stdout=PIPE, stderr=STDOUT` under the hood.
+
+    :param env:
+        The complete environment snapshot for the hook call. When given, it is
+        passed to the subprocess verbatim (including any variables removed from
+        the inherited environment). When ``None`` (the legacy calling
+        convention), a copy of :data:`os.environ` is used and ``extra_environ``
+        is applied as an overlay.
     """
-    env = os.environ.copy()
-    if extra_environ:
-        env.update(extra_environ)
+    if env is None:
+        env = os.environ.copy()
+        if extra_environ:
+            env.update(extra_environ)
 
     # Capturing output in case it fails (available on the exception object)
     subprocess.run(
@@ -146,6 +175,7 @@ class BuildBackendHookCaller:
         backend_path: Optional[Sequence[str]] = None,
         runner: Optional["SubprocessRunner"] = None,
         python_executable: Optional[str] = None,
+        environ: Optional["EnvironOverrides"] = None,
     ) -> None:
         """
         :param source_dir: The source directory to invoke the build backend for
@@ -154,6 +184,13 @@ class BuildBackendHookCaller:
         :param runner: The :ref:`subprocess runner <Subprocess Runners>` to use
         :param python_executable:
             The Python executable used to invoke the build backend
+        :param environ:
+            Environment variable overrides applied to every hook call made via
+            this caller, on top of a fresh copy of :data:`os.environ` taken at
+            call time. A string value sets or overrides the variable; ``None``
+            removes an inherited variable. The caller's process environment is
+            never modified. Per-call overrides may be passed to the hook
+            methods and take precedence over these values.
         """
         if runner is None:
             runner = default_subprocess_runner
@@ -167,6 +204,68 @@ class BuildBackendHookCaller:
         if not python_executable:
             python_executable = sys.executable
         self.python_executable = python_executable
+        self._environ: Dict[str, Optional[str]] = dict(environ or {})
+
+    def _build_environ(
+        self, extra_environ: Optional["EnvironOverrides"] = None
+    ) -> Dict[str, str]:
+        """Build the environment envelope for a single hook call.
+
+        The inheritance base is a snapshot of :data:`os.environ` taken when the
+        hook is *called* (not when this caller was constructed), so parallel
+        callers and successive hooks cannot leak variables to each other.
+        Caller-level and per-call overrides are then applied: strings set or
+        replace the variable, while ``None`` deletes it. A plain ``dict`` of
+        plain strings is returned, ready to be passed to a subprocess.
+        """
+        env = dict(os.environ)
+        overrides = {**self._environ, **(extra_environ or {})}
+        for key, value in overrides.items():
+            if value is None:
+                env.pop(key, None)
+            else:
+                env[key] = value
+        return env
+
+    @staticmethod
+    def _runner_accepts_env(runner: "SubprocessRunner") -> bool:
+        """Check whether a subprocess runner understands the ``env`` snapshot.
+
+        Runners declaring an ``env`` parameter or accepting arbitrary keyword
+        arguments (``**kwargs``) do. When in doubt, fall back to the legacy
+        ``extra_environ`` overlay calling convention to stay compatible.
+        """
+        try:
+            parameters = inspect.signature(runner).parameters.values()
+        except (TypeError, ValueError):
+            return False
+        return any(
+            p.name == "env" or p.kind == inspect.Parameter.VAR_KEYWORD
+            for p in parameters
+        )
+
+    def _invoke_runner(self, cmd: Sequence[str], env: Mapping[str, str]) -> None:
+        """Run the subprocess runner with one frozen environment envelope.
+
+        Environment-aware runners receive the complete snapshot as ``env``.
+        Legacy runners only declaring ``extra_environ`` receive a best-effort
+        overlay of the differences against :data:`os.environ`; variables that
+        only need to be *removed* cannot be expressed with that convention,
+        although the in-process script still installs the authoritative
+        snapshot from ``input.json`` before importing the backend.
+        """
+        if self._runner_accepts_env(self._subprocess_runner):
+            self._subprocess_runner(
+                cmd, cwd=self.source_dir, extra_environ=None, env=env
+            )
+            return
+
+        legacy_extra_environ = {
+            key: value for key, value in env.items() if os.environ.get(key) != value
+        }
+        self._subprocess_runner(
+            cmd, cwd=self.source_dir, extra_environ=legacy_extra_environ
+        )
 
     @contextmanager
     def subprocess_runner(self, runner: "SubprocessRunner") -> Iterator[None]:
@@ -195,17 +294,27 @@ class BuildBackendHookCaller:
         finally:
             self._subprocess_runner = prev
 
-    def _supported_features(self) -> Sequence[str]:
-        """Return the list of optional features supported by the backend."""
-        return self._call_hook("_supported_features", {})
+    def _supported_features(
+        self,
+        environ: Optional["EnvironOverrides"] = None,
+    ) -> Sequence[str]:
+        """Return the list of optional features supported by the backend.
+
+        :param environ: Per-call environment variable overrides; see
+            :class:`BuildBackendHookCaller` for the semantics.
+        """
+        return self._call_hook("_supported_features", {}, environ)
 
     def get_requires_for_build_wheel(
         self,
         config_settings: Optional[Mapping[str, Any]] = None,
+        environ: Optional["EnvironOverrides"] = None,
     ) -> Sequence[str]:
         """Get additional dependencies required for building a wheel.
 
         :param config_settings: The configuration settings for the build backend
+        :param environ: Per-call environment variable overrides; see
+            :class:`BuildBackendHookCaller` for the semantics.
         :returns: A list of :pep:`dependency specifiers <508>`.
 
         .. admonition:: Fallback
@@ -214,7 +323,9 @@ class BuildBackendHookCaller:
             empty list will be returned.
         """
         return self._call_hook(
-            "get_requires_for_build_wheel", {"config_settings": config_settings}
+            "get_requires_for_build_wheel",
+            {"config_settings": config_settings},
+            environ,
         )
 
     def prepare_metadata_for_build_wheel(
@@ -222,6 +333,7 @@ class BuildBackendHookCaller:
         metadata_directory: str,
         config_settings: Optional[Mapping[str, Any]] = None,
         _allow_fallback: bool = True,
+        environ: Optional["EnvironOverrides"] = None,
     ) -> str:
         """Prepare a ``*.dist-info`` folder with metadata for this project.
 
@@ -230,6 +342,8 @@ class BuildBackendHookCaller:
         :param _allow_fallback:
             Whether to allow the fallback to building a wheel and extracting
             the metadata from it. Should be passed as a keyword argument only.
+        :param environ: Per-call environment variable overrides; see
+            :class:`BuildBackendHookCaller` for the semantics.
 
         :returns: Name of the newly created subfolder within
                   ``metadata_directory``, containing the metadata.
@@ -248,6 +362,7 @@ class BuildBackendHookCaller:
                 "config_settings": config_settings,
                 "_allow_fallback": _allow_fallback,
             },
+            environ,
         )
 
     def build_wheel(
@@ -255,12 +370,15 @@ class BuildBackendHookCaller:
         wheel_directory: str,
         config_settings: Optional[Mapping[str, Any]] = None,
         metadata_directory: Optional[str] = None,
+        environ: Optional["EnvironOverrides"] = None,
     ) -> str:
         """Build a wheel from this project.
 
         :param wheel_directory: The directory to write the wheel to
         :param config_settings: The configuration settings for the build backend
         :param metadata_directory: The directory to reuse existing metadata from
+        :param environ: Per-call environment variable overrides; see
+            :class:`BuildBackendHookCaller` for the semantics.
         :returns:
             The name of the newly created wheel within ``wheel_directory``.
 
@@ -280,15 +398,19 @@ class BuildBackendHookCaller:
                 "config_settings": config_settings,
                 "metadata_directory": metadata_directory,
             },
+            environ,
         )
 
     def get_requires_for_build_editable(
         self,
         config_settings: Optional[Mapping[str, Any]] = None,
+        environ: Optional["EnvironOverrides"] = None,
     ) -> Sequence[str]:
         """Get additional dependencies required for building an editable wheel.
 
         :param config_settings: The configuration settings for the build backend
+        :param environ: Per-call environment variable overrides; see
+            :class:`BuildBackendHookCaller` for the semantics.
         :returns: A list of :pep:`dependency specifiers <508>`.
 
         .. admonition:: Fallback
@@ -297,7 +419,9 @@ class BuildBackendHookCaller:
             empty list will be returned.
         """
         return self._call_hook(
-            "get_requires_for_build_editable", {"config_settings": config_settings}
+            "get_requires_for_build_editable",
+            {"config_settings": config_settings},
+            environ,
         )
 
     def prepare_metadata_for_build_editable(
@@ -305,6 +429,7 @@ class BuildBackendHookCaller:
         metadata_directory: str,
         config_settings: Optional[Mapping[str, Any]] = None,
         _allow_fallback: bool = True,
+        environ: Optional["EnvironOverrides"] = None,
     ) -> str:
         """Prepare a ``*.dist-info`` folder with metadata for this project.
 
@@ -313,6 +438,8 @@ class BuildBackendHookCaller:
         :param _allow_fallback:
             Whether to allow the fallback to building a wheel and extracting
             the metadata from it. Should be passed as a keyword argument only.
+        :param environ: Per-call environment variable overrides; see
+            :class:`BuildBackendHookCaller` for the semantics.
         :returns: Name of the newly created subfolder within
                   ``metadata_directory``, containing the metadata.
 
@@ -330,6 +457,7 @@ class BuildBackendHookCaller:
                 "config_settings": config_settings,
                 "_allow_fallback": _allow_fallback,
             },
+            environ,
         )
 
     def build_editable(
@@ -337,12 +465,15 @@ class BuildBackendHookCaller:
         wheel_directory: str,
         config_settings: Optional[Mapping[str, Any]] = None,
         metadata_directory: Optional[str] = None,
+        environ: Optional["EnvironOverrides"] = None,
     ) -> str:
         """Build an editable wheel from this project.
 
         :param wheel_directory: The directory to write the wheel to
         :param config_settings: The configuration settings for the build backend
         :param metadata_directory: The directory to reuse existing metadata from
+        :param environ: Per-call environment variable overrides; see
+            :class:`BuildBackendHookCaller` for the semantics.
         :returns:
             The name of the newly created wheel within ``wheel_directory``.
 
@@ -363,27 +494,36 @@ class BuildBackendHookCaller:
                 "config_settings": config_settings,
                 "metadata_directory": metadata_directory,
             },
+            environ,
         )
 
     def get_requires_for_build_sdist(
         self,
         config_settings: Optional[Mapping[str, Any]] = None,
+        environ: Optional["EnvironOverrides"] = None,
     ) -> Sequence[str]:
         """Get additional dependencies required for building an sdist.
 
+        :param environ: Per-call environment variable overrides; see
+            :class:`BuildBackendHookCaller` for the semantics.
         :returns: A list of :pep:`dependency specifiers <508>`.
         """
         return self._call_hook(
-            "get_requires_for_build_sdist", {"config_settings": config_settings}
+            "get_requires_for_build_sdist",
+            {"config_settings": config_settings},
+            environ,
         )
 
     def build_sdist(
         self,
         sdist_directory: str,
         config_settings: Optional[Mapping[str, Any]] = None,
+        environ: Optional["EnvironOverrides"] = None,
     ) -> str:
         """Build an sdist from this project.
 
+        :param environ: Per-call environment variable overrides; see
+            :class:`BuildBackendHookCaller` for the semantics.
         :returns:
             The name of the newly created sdist within ``sdist_directory``.
         """
@@ -393,27 +533,36 @@ class BuildBackendHookCaller:
                 "sdist_directory": abspath(sdist_directory),
                 "config_settings": config_settings,
             },
+            environ,
         )
 
-    def _call_hook(self, hook_name: str, kwargs: Mapping[str, Any]) -> Any:
-        extra_environ = {"_PYPROJECT_HOOKS_BUILD_BACKEND": self.build_backend}
+    def _call_hook(
+        self,
+        hook_name: str,
+        kwargs: Mapping[str, Any],
+        environ: Optional["EnvironOverrides"] = None,
+    ) -> Any:
+        # Build the environment envelope exactly once for this hook call.
+        # Backend import, hook execution and any fallback in the subprocess
+        # all share this frozen snapshot.
+        env = self._build_environ(environ)
+        env["_PYPROJECT_HOOKS_BUILD_BACKEND"] = self.build_backend
 
         if self.backend_path:
-            extra_environ["_PYPROJECT_HOOKS_BACKEND_PATH_JSON"] = json.dumps(
-                self.backend_path
-            )
+            env["_PYPROJECT_HOOKS_BACKEND_PATH_JSON"] = json.dumps(self.backend_path)
+
+        env_snapshot = MappingProxyType(env)
 
         with tempfile.TemporaryDirectory() as td:
-            hook_input = {"kwargs": kwargs}
+            hook_input = {"kwargs": kwargs, "environ": dict(env_snapshot)}
             write_json(hook_input, pjoin(td, "input.json"), indent=2)
 
             # Run the hook in a subprocess
             with _in_proc_script_path() as script:
                 python = self.python_executable
-                self._subprocess_runner(
+                self._invoke_runner(
                     [python, abspath(str(script)), hook_name, td],
-                    cwd=self.source_dir,
-                    extra_environ=extra_environ,
+                    env=env_snapshot,
                 )
 
             data = read_json(pjoin(td, "output.json"))

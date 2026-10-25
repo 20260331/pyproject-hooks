@@ -2,11 +2,19 @@
 
 It expects:
 - Command line args: hook_name, control_dir
-- Environment variables:
+- control_dir/input.json:
+  - {"kwargs": {...}, "environ": {...}}
+
+``environ`` is the complete environment envelope computed by the frontend for
+this single hook call. It is installed into :data:`os.environ` once, before
+the backend is imported, and the very same frozen snapshot is threaded through
+backend import, hook execution and any fallback - even if imported backend code
+mutates :data:`os.environ`.
+
+For backwards compatibility with older frontends, the envelope may be absent;
+the variables are then read directly from the process environment:
       _PYPROJECT_HOOKS_BUILD_BACKEND=entry.point:spec
       _PYPROJECT_HOOKS_BACKEND_PATH_JSON=paths (JSON encoded)
-- control_dir/input.json:
-  - {"kwargs": {...}}
 
 Results:
 - control_dir/output.json
@@ -23,6 +31,7 @@ from glob import glob
 from importlib import import_module
 from importlib.machinery import PathFinder
 from os.path import join as pjoin
+from types import MappingProxyType
 import warnings
 
 # This file is run as a script, and `import wrappers` is not zip-safe, so we
@@ -56,10 +65,27 @@ class HookMissing(Exception):
         self.hook_name = hook_name
 
 
-def _build_backend():
+def _prepare_environ(envelope):
+    """Install the hook call's environment envelope and freeze it.
+
+    The envelope is the complete environment mapping computed by the frontend
+    for this single hook call. It is installed into ``os.environ`` once,
+    before importing the backend, and a read-only snapshot is returned so that
+    backend import, hook execution and fallback all observe identical values
+    regardless of later mutations of ``os.environ`` by backend code.
+
+    With no envelope (older frontend), the process environment is used as-is.
+    """
+    if envelope is not None:
+        os.environ.clear()
+        os.environ.update(envelope)
+    return MappingProxyType(dict(os.environ))
+
+
+def _build_backend(environ):
     """Find and load the build backend"""
-    backend_path_json = os.environ.get("_PYPROJECT_HOOKS_BACKEND_PATH_JSON")
-    ep = os.environ["_PYPROJECT_HOOKS_BUILD_BACKEND"]
+    backend_path_json = environ.get("_PYPROJECT_HOOKS_BACKEND_PATH_JSON")
+    ep = environ["_PYPROJECT_HOOKS_BUILD_BACKEND"]
     mod_path, _, obj_path = ep.partition(":")
 
     if backend_path_json:
@@ -122,25 +148,25 @@ class _BackendPathFinder:
             return MetadataPathFinder.find_distributions(context=context)
 
 
-def _supported_features():
+def _supported_features(environ):
     """Return the list of options features supported by the backend.
 
     Returns a list of strings.
     The only possible value is 'build_editable'.
     """
-    backend = _build_backend()
+    backend = _build_backend(environ)
     features = []
     if hasattr(backend, "build_editable"):
         features.append("build_editable")
     return features
 
 
-def get_requires_for_build_wheel(config_settings):
+def get_requires_for_build_wheel(environ, config_settings):
     """Invoke the optional get_requires_for_build_wheel hook
 
     Returns [] if the hook is not defined.
     """
-    backend = _build_backend()
+    backend = _build_backend(environ)
     try:
         hook = backend.get_requires_for_build_wheel
     except AttributeError:
@@ -149,12 +175,12 @@ def get_requires_for_build_wheel(config_settings):
         return hook(config_settings)
 
 
-def get_requires_for_build_editable(config_settings):
+def get_requires_for_build_editable(environ, config_settings):
     """Invoke the optional get_requires_for_build_editable hook
 
     Returns [] if the hook is not defined.
     """
-    backend = _build_backend()
+    backend = _build_backend(environ)
     try:
         hook = backend.get_requires_for_build_editable
     except AttributeError:
@@ -164,14 +190,14 @@ def get_requires_for_build_editable(config_settings):
 
 
 def prepare_metadata_for_build_wheel(
-    metadata_directory, config_settings, _allow_fallback
+    environ, metadata_directory, config_settings, _allow_fallback
 ):
     """Invoke optional prepare_metadata_for_build_wheel
 
     Implements a fallback by building a wheel if the hook isn't defined,
     unless _allow_fallback is False in which case HookMissing is raised.
     """
-    backend = _build_backend()
+    backend = _build_backend(environ)
     try:
         hook = backend.prepare_metadata_for_build_wheel
     except AttributeError:
@@ -180,7 +206,9 @@ def prepare_metadata_for_build_wheel(
     else:
         return hook(metadata_directory, config_settings)
     # fallback to build_wheel outside the try block to avoid exception chaining
-    # which can be confusing to users and is not relevant
+    # which can be confusing to users and is not relevant.
+    # The fallback reuses the backend loaded with the same environment
+    # snapshot, so it cannot observe variables leaked by another hook call.
     whl_basename = backend.build_wheel(metadata_directory, config_settings)
     return _get_wheel_metadata_from_wheel(
         whl_basename, metadata_directory, config_settings
@@ -188,7 +216,7 @@ def prepare_metadata_for_build_wheel(
 
 
 def prepare_metadata_for_build_editable(
-    metadata_directory, config_settings, _allow_fallback
+    environ, metadata_directory, config_settings, _allow_fallback
 ):
     """Invoke optional prepare_metadata_for_build_editable
 
@@ -196,7 +224,7 @@ def prepare_metadata_for_build_editable(
     defined, unless _allow_fallback is False in which case HookMissing is
     raised.
     """
-    backend = _build_backend()
+    backend = _build_backend(environ)
     try:
         hook = backend.prepare_metadata_for_build_editable
     except AttributeError:
@@ -271,7 +299,7 @@ def _find_already_built_wheel(metadata_directory):
     return whl_files[0]
 
 
-def build_wheel(wheel_directory, config_settings, metadata_directory=None):
+def build_wheel(environ, wheel_directory, config_settings, metadata_directory=None):
     """Invoke the mandatory build_wheel hook.
 
     If a wheel was already built in the
@@ -283,19 +311,19 @@ def build_wheel(wheel_directory, config_settings, metadata_directory=None):
         shutil.copy2(prebuilt_whl, wheel_directory)
         return os.path.basename(prebuilt_whl)
 
-    return _build_backend().build_wheel(
+    return _build_backend(environ).build_wheel(
         wheel_directory, config_settings, metadata_directory
     )
 
 
-def build_editable(wheel_directory, config_settings, metadata_directory=None):
+def build_editable(environ, wheel_directory, config_settings, metadata_directory=None):
     """Invoke the optional build_editable hook.
 
     If a wheel was already built in the
     prepare_metadata_for_build_editable fallback, this
     will copy it rather than rebuilding the wheel.
     """
-    backend = _build_backend()
+    backend = _build_backend(environ)
     try:
         hook = backend.build_editable
     except AttributeError:
@@ -309,12 +337,12 @@ def build_editable(wheel_directory, config_settings, metadata_directory=None):
         return hook(wheel_directory, config_settings, metadata_directory)
 
 
-def get_requires_for_build_sdist(config_settings):
+def get_requires_for_build_sdist(environ, config_settings):
     """Invoke the optional get_requires_for_build_wheel hook
 
     Returns [] if the hook is not defined.
     """
-    backend = _build_backend()
+    backend = _build_backend(environ)
     try:
         hook = backend.get_requires_for_build_sdist
     except AttributeError:
@@ -334,9 +362,9 @@ class GotUnsupportedOperation(Exception):
         self.traceback = traceback
 
 
-def build_sdist(sdist_directory, config_settings):
+def build_sdist(environ, sdist_directory, config_settings):
     """Invoke the mandatory build_sdist hook."""
-    backend = _build_backend()
+    backend = _build_backend(environ)
     try:
         return backend.build_sdist(sdist_directory, config_settings)
     except getattr(backend, "UnsupportedOperation", _DummyException):
@@ -375,10 +403,14 @@ def main():
 
     hook_input = read_json(pjoin(control_dir, "input.json"))
 
+    # Install and freeze the environment envelope once, before any backend
+    # code is imported. Every phase of this hook call shares this snapshot.
+    environ = _prepare_environ(hook_input.get("environ"))
+
     with warnings.catch_warnings(record=True) as captured_warnings:
         json_out = {"unsupported": False, "return_val": None}
         try:
-            json_out["return_val"] = hook(**hook_input["kwargs"])
+            json_out["return_val"] = hook(environ, **hook_input["kwargs"])
         except BackendUnavailable as e:
             json_out["no_backend"] = True
             json_out["traceback"] = e.traceback
